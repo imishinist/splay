@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -26,6 +27,11 @@ scenarios:
     - name: status_code=200
       status_code: 200
 */
+
+func init() {
+	http.DefaultTransport.(*http.Transport).MaxIdleConns = 0
+	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 3000
+}
 
 // ScenarioData is scenario yaml file structure
 type ScenarioData struct {
@@ -142,7 +148,10 @@ func Run(ctx context.Context, sd ScenarioData) {
 }
 
 func main() {
-	f, err := os.Open("scenario.yml")
+	scenarioFileName := flag.String("f", "scenario.yml", "scenario file")
+	flag.Parse()
+
+	f, err := os.Open(*scenarioFileName)
 	if err != nil {
 		log.Fatal(err)
 	}
