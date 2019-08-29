@@ -28,6 +28,10 @@ scenarios:
       status_code: 200
 */
 
+var (
+	httpWorkerNum = 100
+)
+
 func init() {
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 0
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 3000
@@ -73,25 +77,6 @@ func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	return &s, nil
 }
 
-func scenarioReq(ctx context.Context, s Scenario) error {
-	req, _ := http.NewRequest("GET", s.URL, nil)
-	req = req.WithContext(ctx)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	for _, v := range s.Validates {
-		// validate
-		if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
-			return xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
-		}
-	}
-	return nil
-}
-
 // ScenarioRun runs scenario with context
 func ScenarioRun(ctx context.Context, s Scenario) {
 	rl := rate.NewLimiter(rate.Limit(s.Throughput), 1)
@@ -111,6 +96,32 @@ func ScenarioRun(ctx context.Context, s Scenario) {
 		count = *s.Count
 	}
 
+	httpReqs := make(chan *http.Request, httpWorkerNum)
+
+	for i := 0; i < httpWorkerNum; i++ {
+		go func() {
+			for {
+				req := <-httpReqs
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					log.Printf("[%s] Error: %s", s.Name, err)
+					return
+				}
+				_ = resp.Body.Close()
+
+				for _, v := range s.Validates {
+					// validate
+					if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
+						err := xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
+						log.Printf("[%s] Error: %s", s.Name, err)
+						return
+					}
+				}
+				log.Printf("[%s] Success", s.Name)
+			}
+		}()
+	}
+
 	for i := 1; i <= count; i++ {
 		select {
 		case <-ctx.Done():
@@ -120,13 +131,12 @@ func ScenarioRun(ctx context.Context, s Scenario) {
 			}
 			return
 		case <-rlCh:
-			if err := scenarioReq(ctx, s); err != nil {
-				log.Printf("[%s] Error: %s", s.Name, err)
-				continue
-			}
-			log.Printf("[%s] Success", s.Name)
+			req, _ := http.NewRequest("GET", s.URL, nil)
+			req = req.WithContext(ctx)
+			httpReqs <- req
 		}
 	}
+
 	log.Printf("[%s] finished", s.Name)
 }
 
@@ -149,6 +159,7 @@ func Run(ctx context.Context, sd ScenarioData) {
 
 func main() {
 	scenarioFileName := flag.String("f", "scenario.yml", "scenario file")
+	flag.IntVar(&httpWorkerNum, "c", 100, "http request concurrency per scenario")
 	flag.Parse()
 
 	f, err := os.Open(*scenarioFileName)
