@@ -19,7 +19,13 @@ scenarios:
       status_code: 200
 ```
 
+
+## How to run
+
 ```bash
 splay
 ```
+
+# Author
+Taisuke Miyazaki, [@imishinist](https://twitter.com/imishinist)
 
