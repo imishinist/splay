@@ -1,0 +1,25 @@
+service:
+  project-path: github.com/imishinist/splay
+
+run:
+  concurrency: 4
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+linters-settings:
+  gofmt:
+    simplify: true
+  gocyclo:
+    min-complexity: 15
+  golint:
+    min-confidence: 0.8
+
+linters:
+  enable-all: true
+  disable:
+    - scopelint
+    - gochecknoglobals
+    - gochecknoinits
