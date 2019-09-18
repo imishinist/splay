@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 	"golang.org/x/xerrors"
@@ -94,13 +95,12 @@ L:
 			return
 		}
 
-		/*
-			ctx, cancel = context.WithTimeout(httpTimeout * time.Second)
-			req = req.WithContext(ctx)
-		*/
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(httpTimeout)*time.Second)
+		req = req.WithContext(ctx)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			log.Printf("[%s] Error: %s", s.Name, err)
+			cancel()
 			done <- struct{}{}
 			return
 		}
@@ -111,10 +111,12 @@ L:
 			if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
 				err := xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
 				log.Printf("[%s] Error: %s", s.Name, err)
+				cancel()
 				continue L
 			}
 		}
 		log.Printf("[%s] Success", s.Name)
+		cancel()
 		done <- struct{}{}
 	}
 }
