@@ -63,8 +63,10 @@ type Validate struct {
 	StatusCode *int `yaml:"status_code"`
 }
 
+// ResultState is state of scenario result
 type ResultState int
 
+// Result enum
 const (
 	ResultOK ResultState = iota
 	ResultValidationFail
@@ -87,14 +89,18 @@ func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	return &s, nil
 }
 
-func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario, done chan<- struct{}, reportCh chan<- ResultState) {
+func scenarioWorker(
+	ctx context.Context,
+	scenarioCh <-chan Scenario,
+	done chan<- struct{},
+	reportCh chan<- ResultState) {
 L:
 	for {
 		var s Scenario
 		select {
-		case s = <-scenarioCh:
 		case <-ctx.Done():
 			return
+		case s = <-scenarioCh:
 		}
 		req, err := http.NewRequest("GET", s.URL, nil)
 		if err != nil {
@@ -133,8 +139,15 @@ L:
 	}
 }
 
+// ScenarioReport is aggregated scenario result
+type ScenarioReport struct {
+	SuccessCount        int
+	ValidationFailCount int
+	RequestFailCount    int
+}
+
 // ScenarioRun runs scenario with context
-func ScenarioRun(ctx context.Context, s Scenario) {
+func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 	rl := rate.NewLimiter(rate.Limit(s.Throughput), 1)
 
 	rlCh := make(chan struct{})
@@ -187,16 +200,21 @@ func ScenarioRun(ctx context.Context, s Scenario) {
 
 	var success, validationFail, requestFail int
 	for state := range reportCh {
-		if state == ResultOK {
+		switch state {
+		case ResultOK:
 			success++
-		} else if state == ResultValidationFail {
+		case ResultValidationFail:
 			validationFail++
-		} else if state == ResultRequestFail {
+		case ResultRequestFail:
 			requestFail++
+		default:
 		}
 	}
-
-	log.Printf("[%s] finished, success: %d, validation fail: %d, request fail: %d", s.Name, success, validationFail, requestFail)
+	return ScenarioReport{
+		SuccessCount:        success,
+		ValidationFailCount: validationFail,
+		RequestFailCount:    requestFail,
+	}
 }
 
 func main() {
@@ -233,15 +251,31 @@ func main() {
 	}()
 
 	wg := sync.WaitGroup{}
+	mutex := sync.Mutex{}
+	reports := make(map[string]ScenarioReport)
 	for _, s := range scenario.Scenarios {
 		wg.Add(1)
 		go func(s Scenario) {
 			defer wg.Done()
-			ScenarioRun(ctx, s)
+			defer mutex.Unlock()
+
+			report := ScenarioRun(ctx, s)
+			mutex.Lock()
+			reports[s.Name] = report
 		}(s)
 	}
 
 	log.Println("Running")
 	wg.Wait()
-	log.Println("Finished")
+	log.Println("--------------------Result--------------------")
+
+	for name, report := range reports {
+		var (
+			success        = report.SuccessCount
+			validationFail = report.ValidationFailCount
+			requestFail    = report.RequestFailCount
+		)
+		log.Printf("finished|[%s]\tsuccess: %d, validation fail: %d, request fail: %d",
+			name, success, validationFail, requestFail)
+	}
 }
