@@ -63,6 +63,14 @@ type Validate struct {
 	StatusCode *int `yaml:"status_code"`
 }
 
+type ResultState int
+
+const (
+	ResultOK ResultState = iota
+	ResultValidationFail
+	ResultRequestFail
+)
+
 // LoadScenarioFile read file and map ScenarioData
 func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	bytes, err := ioutil.ReadAll(in)
@@ -79,7 +87,7 @@ func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	return &s, nil
 }
 
-func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario, done chan<- struct{}) {
+func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario, done chan<- struct{}, reportCh chan<- ResultState) {
 L:
 	for {
 		var s Scenario
@@ -91,6 +99,7 @@ L:
 		req, err := http.NewRequest("GET", s.URL, nil)
 		if err != nil {
 			log.Printf("[%s] Error: %s", s.Name, err)
+			reportCh <- ResultRequestFail
 			done <- struct{}{}
 			return
 		}
@@ -100,6 +109,7 @@ L:
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			log.Printf("[%s] Error: %s", s.Name, err)
+			reportCh <- ResultRequestFail
 			cancel()
 			done <- struct{}{}
 			return
@@ -110,12 +120,14 @@ L:
 			// validate
 			if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
 				err := xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
+				reportCh <- ResultValidationFail
 				log.Printf("[%s] Error: %s", s.Name, err)
 				cancel()
 				continue L
 			}
 		}
 		log.Printf("[%s] Success", s.Name)
+		reportCh <- ResultOK
 		cancel()
 		done <- struct{}{}
 	}
@@ -146,30 +158,45 @@ func ScenarioRun(ctx context.Context, s Scenario) {
 
 	done := make(chan struct{})
 	scenarioCh := make(chan Scenario, httpWorkerNum)
+	reportCh := make(chan ResultState)
 
 	for i := 0; i < httpWorkerNum; i++ {
-		go scenarioWorker(ctx, scenarioCh, done)
+		go scenarioWorker(ctx, scenarioCh, done, reportCh)
 	}
 
-	var c int
-	for i := 1; i <= count; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-rlCh:
-			if !ok {
+	go func() {
+		defer close(reportCh)
+		var c int
+		for i := 1; i <= count; i++ {
+			select {
+			case <-ctx.Done():
 				return
+			case _, ok := <-rlCh:
+				if !ok {
+					return
+				}
+				c++
+				scenarioCh <- s
 			}
-			c++
-			scenarioCh <- s
+		}
+
+		for i := 0; i < c; i++ {
+			<-done
+		}
+	}()
+
+	var success, validationFail, requestFail int
+	for state := range reportCh {
+		if state == ResultOK {
+			success++
+		} else if state == ResultValidationFail {
+			validationFail++
+		} else if state == ResultRequestFail {
+			requestFail++
 		}
 	}
 
-	for i := 0; i < c; i++ {
-		<-done
-	}
-
-	log.Printf("[%s] finished", s.Name)
+	log.Printf("[%s] finished, success: %d, validation fail: %d, request fail: %d", s.Name, success, validationFail, requestFail)
 }
 
 func main() {
