@@ -30,6 +30,7 @@ scenarios:
 
 var (
 	httpWorkerNum = 100
+	httpTimeout   = 10
 )
 
 func init() {
@@ -77,14 +78,59 @@ func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	return &s, nil
 }
 
+func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario, done chan<- struct{}) {
+L:
+	for {
+		var s Scenario
+		select {
+		case s = <-scenarioCh:
+		case <-ctx.Done():
+			return
+		}
+		req, err := http.NewRequest("GET", s.URL, nil)
+		if err != nil {
+			log.Printf("[%s] Error: %s", s.Name, err)
+			done <- struct{}{}
+			return
+		}
+
+		/*
+			ctx, cancel = context.WithTimeout(httpTimeout * time.Second)
+			req = req.WithContext(ctx)
+		*/
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("[%s] Error: %s", s.Name, err)
+			done <- struct{}{}
+			return
+		}
+		_ = resp.Body.Close()
+
+		for _, v := range s.Validates {
+			// validate
+			if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
+				err := xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
+				log.Printf("[%s] Error: %s", s.Name, err)
+				continue L
+			}
+		}
+		log.Printf("[%s] Success", s.Name)
+		done <- struct{}{}
+	}
+}
+
 // ScenarioRun runs scenario with context
 func ScenarioRun(ctx context.Context, s Scenario) {
 	rl := rate.NewLimiter(rate.Limit(s.Throughput), 1)
 
 	rlCh := make(chan struct{})
 	go func() {
+		defer close(rlCh)
 		for {
-			_ = rl.Wait(ctx)
+			err := rl.Wait(ctx)
+			if err != nil {
+				return
+			}
 			rlCh <- struct{}{}
 		}
 	}()
@@ -96,65 +142,32 @@ func ScenarioRun(ctx context.Context, s Scenario) {
 		count = *s.Count
 	}
 
-	httpReqs := make(chan *http.Request, httpWorkerNum)
+	done := make(chan struct{})
+	scenarioCh := make(chan Scenario, httpWorkerNum)
 
 	for i := 0; i < httpWorkerNum; i++ {
-		go func() {
-			for {
-				req := <-httpReqs
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					log.Printf("[%s] Error: %s", s.Name, err)
-					return
-				}
-				_ = resp.Body.Close()
-
-				for _, v := range s.Validates {
-					// validate
-					if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
-						err := xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
-						log.Printf("[%s] Error: %s", s.Name, err)
-						return
-					}
-				}
-				log.Printf("[%s] Success", s.Name)
-			}
-		}()
+		go scenarioWorker(ctx, scenarioCh, done)
 	}
 
+	var c int
 	for i := 1; i <= count; i++ {
 		select {
 		case <-ctx.Done():
-			err := ctx.Err()
-			if err != nil {
-				log.Println(err)
-			}
 			return
-		case <-rlCh:
-			req, _ := http.NewRequest("GET", s.URL, nil)
-			req = req.WithContext(ctx)
-			httpReqs <- req
+		case _, ok := <-rlCh:
+			if !ok {
+				return
+			}
+			c++
+			scenarioCh <- s
 		}
 	}
 
-	log.Printf("[%s] finished", s.Name)
-}
-
-// Run runs all scenarios concurrently
-func Run(ctx context.Context, sd ScenarioData) {
-	wg := sync.WaitGroup{}
-
-	for _, s := range sd.Scenarios {
-		wg.Add(1)
-		go func(s Scenario) {
-			defer wg.Done()
-			ScenarioRun(ctx, s)
-		}(s)
+	for i := 0; i < c; i++ {
+		<-done
 	}
 
-	log.Println("Running")
-	wg.Wait()
-	log.Println("Finished")
+	log.Printf("[%s] finished", s.Name)
 }
 
 func main() {
@@ -190,5 +203,16 @@ func main() {
 
 	}()
 
-	Run(ctx, *scenario)
+	wg := sync.WaitGroup{}
+	for _, s := range scenario.Scenarios {
+		wg.Add(1)
+		go func(s Scenario) {
+			defer wg.Done()
+			ScenarioRun(ctx, s)
+		}(s)
+	}
+
+	log.Println("Running")
+	wg.Wait()
+	log.Println("Finished")
 }
