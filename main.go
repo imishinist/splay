@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,17 +28,19 @@ scenarios:
     validates:
     - name: status_code=200
       status_code: 200
+    disable_keepalive: true
+    keepalive: 10
+    idle_timeout: 10
 */
 
 var (
 	httpWorkerNum = 20
 	httpTimeout   = 10
-)
 
-func init() {
-	http.DefaultTransport.(*http.Transport).MaxIdleConns = 0
-	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 3000
-}
+	defaultDisableKeepalive = true
+	defaultKeepalive        = 10 * time.Second
+	defaultIdleTimeout      = 10 * time.Second
+)
 
 // ScenarioData is scenario yaml file structure
 type ScenarioData struct {
@@ -52,6 +55,10 @@ type Scenario struct {
 	Period     *int    `yaml:"period"`
 	Count      *int    `yaml:"count"`
 	Throughput float64 `yaml:"throughput"`
+
+	DisableKeepalive *bool `yaml:"disable_keepalive"`
+	Keepalive        *int  `yaml:"keepalive"`
+	IdleTimeout      *int  `yaml:"idle_timeout"`
 
 	Validates []Validate `yaml:",flow"`
 }
@@ -89,7 +96,7 @@ func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	return &s, nil
 }
 
-func runHttpRequest(ctx context.Context, s Scenario) (*http.Response, error) {
+func runHttpRequest(ctx context.Context, s Scenario, th *transportHolder) (*http.Response, error) {
 	req, err := http.NewRequest("GET", s.URL, nil)
 	if err != nil {
 		log.Printf("[%s] Error: %s", s.Name, err)
@@ -100,11 +107,15 @@ func runHttpRequest(ctx context.Context, s Scenario) (*http.Response, error) {
 	defer cancel()
 
 	req = req.WithContext(ctx)
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Transport: th.getTransport(s.DisableKeepalive, s.Keepalive, s.IdleTimeout),
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[%s] Error: %s", s.Name, err)
 		return nil, err
 	}
+	_, _ = io.Copy(ioutil.Discard, resp.Body)
 	_ = resp.Body.Close()
 	return resp, nil
 }
@@ -118,8 +129,8 @@ func checkResponse(ctx context.Context, s Scenario, res *http.Response) error {
 	return nil
 }
 
-func syncWorker(ctx context.Context, s Scenario) ResultState {
-	res, err := runHttpRequest(ctx, s)
+func syncWorker(ctx context.Context, s Scenario, th *transportHolder) ResultState {
+	res, err := runHttpRequest(ctx, s, th)
 	if err != nil {
 		return ResultRequestFail
 	}
@@ -132,15 +143,13 @@ func syncWorker(ctx context.Context, s Scenario) ResultState {
 	return ResultOK
 }
 
-func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario) <-chan ResultState {
+func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario, th *transportHolder) <-chan ResultState {
 	reportCh := make(chan ResultState)
 
 	go func() {
 		defer close(reportCh)
 		for s := range scenarioCh {
-			log.Println("scenario received")
-			reportCh <- syncWorker(ctx, s)
-			log.Println("reported")
+			reportCh <- syncWorker(ctx, s, th)
 		}
 	}()
 	return reportCh
@@ -177,7 +186,7 @@ func merge(channels ...<-chan ResultState) <-chan ResultState {
 }
 
 // ScenarioRun runs scenario with context
-func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
+func ScenarioRun(ctx context.Context, s Scenario, th *transportHolder) ScenarioReport {
 	rl := rate.NewLimiter(rate.Limit(s.Throughput), 1)
 
 	rlCh := make(chan struct{})
@@ -199,13 +208,11 @@ func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 		count = *s.Count
 	}
 
-	log.Println("scenario worker starting")
 	scenarioCh := make(chan Scenario)
 	chs := make([]<-chan ResultState, 0, httpWorkerNum)
 	for i := 0; i < httpWorkerNum; i++ {
-		chs = append(chs, scenarioWorker(ctx, scenarioCh))
+		chs = append(chs, scenarioWorker(ctx, scenarioCh, th))
 	}
-	log.Println("scenario worker started")
 
 	go func() {
 		defer close(scenarioCh)
@@ -219,11 +226,9 @@ func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 					return
 				}
 				c++
-				log.Println("scenario inserting")
 				scenarioCh <- s
 			}
 		}
-		log.Println("scenario ch closing")
 	}()
 
 	reportCh := merge(chs...)
@@ -239,12 +244,92 @@ func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 		default:
 		}
 	}
-	log.Println("Report Ch Closed")
 	return ScenarioReport{
 		SuccessCount:        success,
 		ValidationFailCount: validationFail,
 		RequestFailCount:    requestFail,
 	}
+}
+
+type transportHolder struct {
+	transport       *http.Transport
+	sync            sync.Mutex
+	refreshDeadline time.Time
+}
+
+func (th *transportHolder) getTransport(disableKeepalive_ *bool, keepaliveTimeout_ *int, idleTimeout_ *int) *http.Transport {
+	th.sync.Lock()
+	defer th.sync.Unlock()
+
+	disableKeepalive := defaultDisableKeepalive
+	keepaliveTimeout := defaultKeepalive
+	idleTimeout := defaultIdleTimeout
+
+	if disableKeepalive_ != nil {
+		disableKeepalive = *disableKeepalive_
+	}
+	if keepaliveTimeout_ != nil {
+		keepaliveTimeout = time.Duration(*keepaliveTimeout_) * time.Second
+	}
+	if idleTimeout_ != nil {
+		idleTimeout = time.Duration(*idleTimeout_) * time.Second
+	}
+
+	if disableKeepalive {
+		if th.transport == nil {
+			th.transport = &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+					DualStack: true,
+				}).DialContext,
+				DisableKeepAlives:     disableKeepalive,
+				MaxIdleConns:          0,
+				MaxIdleConnsPerHost:   1000,
+				MaxConnsPerHost:       0,
+				IdleConnTimeout:       idleTimeout,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+			log.Println("transport generated")
+		}
+		return th.transport
+	}
+
+	now := time.Now()
+	if th.transport == nil || now.After(th.refreshDeadline) {
+		old := th.transport
+
+		// https://golang.org/src/net/http/transport.go
+		th.transport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			DisableKeepAlives:     disableKeepalive,
+			MaxIdleConns:          0,
+			MaxIdleConnsPerHost:   1000,
+			MaxConnsPerHost:       0,
+			IdleConnTimeout:       idleTimeout,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+		log.Println("transport refreshed")
+
+		deadline := now.Add(keepaliveTimeout)
+		th.refreshDeadline = deadline
+
+		if old != nil {
+			go func() {
+				time.Sleep(idleTimeout + time.Second)
+				old.CloseIdleConnections()
+				log.Println("idle connection closed")
+			}()
+		}
+	}
+
+	return th.transport
 }
 
 func main() {
@@ -290,7 +375,7 @@ func main() {
 			defer mutex.Unlock()
 
 			log.Printf("%s scenario start\n", s.Name)
-			report := ScenarioRun(ctx, s)
+			report := ScenarioRun(ctx, s, &transportHolder{})
 			mutex.Lock()
 			reports[s.Name] = report
 		}(s)
