@@ -30,7 +30,7 @@ scenarios:
 */
 
 var (
-	httpWorkerNum = 100
+	httpWorkerNum = 20
 	httpTimeout   = 10
 )
 
@@ -89,54 +89,61 @@ func LoadScenarioFile(in io.Reader) (*ScenarioData, error) {
 	return &s, nil
 }
 
-func scenarioWorker(
-	ctx context.Context,
-	scenarioCh <-chan Scenario,
-	done chan<- struct{},
-	reportCh chan<- ResultState) {
-L:
-	for {
-		var s Scenario
-		select {
-		case <-ctx.Done():
-			return
-		case s = <-scenarioCh:
-		}
-		req, err := http.NewRequest("GET", s.URL, nil)
-		if err != nil {
-			log.Printf("[%s] Error: %s", s.Name, err)
-			reportCh <- ResultRequestFail
-			done <- struct{}{}
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(httpTimeout)*time.Second)
-		req = req.WithContext(ctx)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("[%s] Error: %s", s.Name, err)
-			reportCh <- ResultRequestFail
-			cancel()
-			done <- struct{}{}
-			return
-		}
-		_ = resp.Body.Close()
-
-		for _, v := range s.Validates {
-			// validate
-			if v.StatusCode != nil && resp.StatusCode != *v.StatusCode {
-				err := xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, resp.StatusCode)
-				reportCh <- ResultValidationFail
-				log.Printf("[%s] Error: %s", s.Name, err)
-				cancel()
-				continue L
-			}
-		}
-		log.Printf("[%s] Success", s.Name)
-		reportCh <- ResultOK
-		cancel()
-		done <- struct{}{}
+func runHttpRequest(ctx context.Context, s Scenario) (*http.Response, error) {
+	req, err := http.NewRequest("GET", s.URL, nil)
+	if err != nil {
+		log.Printf("[%s] Error: %s", s.Name, err)
+		return nil, err
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(httpTimeout)*time.Second)
+	defer cancel()
+
+	req = req.WithContext(ctx)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[%s] Error: %s", s.Name, err)
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	return resp, nil
+}
+
+func checkResponse(ctx context.Context, s Scenario, res *http.Response) error {
+	for _, v := range s.Validates {
+		if v.StatusCode != nil && res.StatusCode != *v.StatusCode {
+			return xerrors.Errorf("%s: status code is invalid: expected: %v, got: %v", v.Name, *v.StatusCode, res.StatusCode)
+		}
+	}
+	return nil
+}
+
+func syncWorker(ctx context.Context, s Scenario) ResultState {
+	res, err := runHttpRequest(ctx, s)
+	if err != nil {
+		return ResultRequestFail
+	}
+	if err := checkResponse(ctx, s, res); err != nil {
+		log.Printf("[%s] error: %v", s.Name, err)
+		return ResultValidationFail
+	}
+	log.Printf("[%s] Success", s.Name)
+
+	return ResultOK
+}
+
+func scenarioWorker(ctx context.Context, scenarioCh <-chan Scenario) <-chan ResultState {
+	reportCh := make(chan ResultState)
+
+	go func() {
+		defer close(reportCh)
+		for s := range scenarioCh {
+			log.Println("scenario received")
+			reportCh <- syncWorker(ctx, s)
+			log.Println("reported")
+		}
+	}()
+	return reportCh
 }
 
 // ScenarioReport is aggregated scenario result
@@ -144,6 +151,29 @@ type ScenarioReport struct {
 	SuccessCount        int
 	ValidationFailCount int
 	RequestFailCount    int
+}
+
+func merge(channels ...<-chan ResultState) <-chan ResultState {
+	var wg sync.WaitGroup
+	ret := make(chan ResultState)
+
+	wg.Add(len(channels))
+	for _, c := range channels {
+		c := c
+		go func() {
+			for i := range c {
+				ret <- i
+			}
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(ret)
+	}()
+
+	return ret
 }
 
 // ScenarioRun runs scenario with context
@@ -169,16 +199,16 @@ func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 		count = *s.Count
 	}
 
-	done := make(chan struct{})
-	scenarioCh := make(chan Scenario, httpWorkerNum)
-	reportCh := make(chan ResultState)
-
+	log.Println("scenario worker starting")
+	scenarioCh := make(chan Scenario)
+	chs := make([]<-chan ResultState, 0, httpWorkerNum)
 	for i := 0; i < httpWorkerNum; i++ {
-		go scenarioWorker(ctx, scenarioCh, done, reportCh)
+		chs = append(chs, scenarioWorker(ctx, scenarioCh))
 	}
+	log.Println("scenario worker started")
 
 	go func() {
-		defer close(reportCh)
+		defer close(scenarioCh)
 		var c int
 		for i := 1; i <= count; i++ {
 			select {
@@ -189,15 +219,14 @@ func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 					return
 				}
 				c++
+				log.Println("scenario inserting")
 				scenarioCh <- s
 			}
 		}
-
-		for i := 0; i < c; i++ {
-			<-done
-		}
+		log.Println("scenario ch closing")
 	}()
 
+	reportCh := merge(chs...)
 	var success, validationFail, requestFail int
 	for state := range reportCh {
 		switch state {
@@ -210,6 +239,7 @@ func ScenarioRun(ctx context.Context, s Scenario) ScenarioReport {
 		default:
 		}
 	}
+	log.Println("Report Ch Closed")
 	return ScenarioReport{
 		SuccessCount:        success,
 		ValidationFailCount: validationFail,
@@ -247,18 +277,19 @@ func main() {
 		default:
 			log.Println("Unknown")
 		}
-
 	}()
 
 	wg := sync.WaitGroup{}
 	mutex := sync.Mutex{}
 	reports := make(map[string]ScenarioReport)
 	for _, s := range scenario.Scenarios {
+		s := s
 		wg.Add(1)
 		go func(s Scenario) {
 			defer wg.Done()
 			defer mutex.Unlock()
 
+			log.Printf("%s scenario start\n", s.Name)
 			report := ScenarioRun(ctx, s)
 			mutex.Lock()
 			reports[s.Name] = report
